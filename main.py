@@ -12,15 +12,15 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from torch_geometric.data import Data
 from torch_geometric.nn import global_mean_pool
 
-# ===== 项目内工具 / 模型 =====
-from utils_torch import MI as calculate_MI            # Rényi MI
-from utils_torch import calculate_conditional_MI      # 旧接口，以安全包装函数使用
+
+from utils_torch import MI as calculate_MI            
+from utils_torch import calculate_conditional_MI      
 from transformer import SingleGraphTransformer
 from GraphVAE import GraphDecoder
 
-# ---------- 1. 数据集 ----------
+
 class GraphDecoupledDataset(Dataset):
-    """读取 decoupled_data2.json 并返回 (特征, 边索引, 标签)。"""
+
 
     def __init__(self, json_path: str | Path):
         with open(json_path, "r") as f:
@@ -41,10 +41,7 @@ class GraphDecoupledDataset(Dataset):
         return dist_sMRI, dist_dMRI, sMRI_edge, dMRI_edge, age
 
 
-# ---------- 2. 因果效应模块 ----------
-
 def safe_conditional_MI(x: torch.Tensor, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """包装 `calculate_conditional_MI`，当样本数 < 2 时返回 0，避免 k out‑of‑range。"""
     if x.size(0) < 2:  # e.g. batch_size == 1
         return torch.tensor(0.0, device=x.device)
     return calculate_conditional_MI(x, z, y)
@@ -58,7 +55,6 @@ def joint_uncond(
     regressor: SingleGraphTransformer,
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """返回 (ce, pred)。"""
 
     if getattr(data, "batch", None) is None:
         data.batch = torch.zeros(data.x.size(0), dtype=torch.long, device=device)
@@ -66,17 +62,13 @@ def joint_uncond(
     graph_alpha = global_mean_pool(alpha.to(device), data.batch)
     graph_beta  = global_mean_pool(beta.to(device),  data.batch)
 
-    # 预测
+
     pred = regressor(data)
 
-    # labels → (B,1)
     labels = data.y.to(device).float().view(-1, 1)
     ce = safe_conditional_MI(graph_alpha, labels, graph_beta)
 
     return ce, pred
-
-
-# ---------- 3. 训练 ----------
 
 def main():  # noqa: D401
     json_path = Path("decoupled_data2.json")
@@ -119,31 +111,22 @@ def main():  # noqa: D401
 
             opt.zero_grad()
 
-            # ---- 嵌入 ----
             s_embed = s_trans.encoder(dist_s)  # (N_s,64)
             d_embed = d_trans.encoder(dist_d)
             split = latent_dim
             s_a, s_b = s_embed[:, :split], s_embed[:, split:]
             d_a, d_b = d_embed[:, :split], d_embed[:, split:]
-
-            # ---- MI ----
             s_mi = calculate_MI(s_a, s_b)
             d_mi = calculate_MI(d_a, d_b)
             x_mi = calculate_MI(s_a, d_a)
             mi_loss = λ_mi * (s_mi + d_mi + x_mi)
-
-            # ---- 因果 + 预测 ----
             s_graph = Data(x=dist_s, edge_index=e_s, y=age)
             d_graph = Data(x=dist_d, edge_index=e_d, y=age)
             ce_s, pred_s = joint_uncond(s_a, s_b, s_graph, decoder, s_trans, device)
             ce_d, pred_d = joint_uncond(d_a, d_b, d_graph, decoder, d_trans, device)
             ce_loss = λ_ce * (ce_s + ce_d)
-
-            # ---- 回归 ----
             y_true = age.unsqueeze(0).unsqueeze(1)
             reg_loss = λ_reg * (crit(pred_s, y_true) + crit(pred_d, y_true))
-
-            # ---- 总损失 ----
             loss = reg_loss + mi_loss - ce_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(list(s_trans.parameters()) + list(d_trans.parameters()) + list(decoder.parameters()), 5.)
@@ -152,8 +135,6 @@ def main():  # noqa: D401
             tot_loss += loss.item(); tot_reg += reg_loss.item(); tot_mi += mi_loss.item()
 
         print(f"[Train] Epoch {ep:3d}/{epochs} | Loss {tot_loss/len(train_loader):.4f} | Reg {tot_reg/len(train_loader):.4f} | MI {tot_mi/len(train_loader):.4f}")
-
-    # ---------- 4. 测试 ----------
     s_trans.eval(); d_trans.eval(); decoder.eval()
     preds, gts = [], []
     with torch.no_grad():
