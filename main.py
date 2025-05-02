@@ -1,65 +1,188 @@
-import networkx as nx
-import matplotlib.pyplot as plt
+from __future__ import annotations
 
-# 创建图
-G = nx.Graph()
+import json
+from pathlib import Path
+from typing import List, Tuple
 
-# 添加节点及其坐标
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+from torch_geometric.data import Data
+from torch_geometric.nn import global_mean_pool
 
-positions = {
-    0: (0.7, 1.0),
-    1: (0.4, 0.3),
-    2: (0.7, 0.6),
-    3: (0.2, 0.7),
-    4: (0.4, 0.2),
-}
+# ===== 项目内工具 / 模型 =====
+from utils_torch import MI as calculate_MI            # Rényi MI
+from utils_torch import calculate_conditional_MI      # 旧接口，以安全包装函数使用
+from transformer import SingleGraphTransformer
+from GraphVAE import GraphDecoder
 
-positions = {
-    0: (0.7, 1.0),
-    1: (0.1, 0.3),
-    2: (0.7, 0.6),
-    3: (0.2, 0.5),
-    4: (0.9, 0.2),
-}
+# ---------- 1. 数据集 ----------
+class GraphDecoupledDataset(Dataset):
+    """读取 decoupled_data2.json 并返回 (特征, 边索引, 标签)。"""
 
-positions = {
-    0: (0.7, 1.0),
-    1: (0.1, 0.3),
-    2: (0.7, 0.6),
-    3: (0.2, 0.5),
-    4: (0.9, 0.2),
-    5: (0.7, 1.0),
-    6: (0.4, 0.3),
-    7: (0.7, 0.6),
-    8: (0.2, 0.7),
-    9: (0.4, 0.2),
-}
+    def __init__(self, json_path: str | Path):
+        with open(json_path, "r") as f:
+            self.samples: List[dict] = json.load(f)
 
-G.add_nodes_from(positions.keys())
+    def __len__(self):  # noqa: D401
+        return len(self.samples)
 
-# 添加边（不规则连接）
-edges = [
-    (0, 1),
-    (0, 2),
-    (1, 3),
-    (2, 4),
-    (1, 2),
-    (5, 8),
-    (5, 7),
-    (6, 9),
-    (6, 7),
-]
-G.add_edges_from(edges)
+    def __getitem__(self, idx: int):  # noqa: D401
+        s = self.samples[idx]
+        age = torch.tensor(s["age"], dtype=torch.float)
 
-# 绘图
-plt.figure(figsize=(6, 6))
-nx.draw(
-    G,
-    pos=positions,
-    with_labels=False,
-    node_size=300,
-    node_color='black',
-    edge_color='black',
-    width=2
-)
-plt.show()
+        dist_sMRI = torch.tensor(s["dist_sMRI"], dtype=torch.float)
+        dist_dMRI = torch.tensor(s["dist_dMRI"], dtype=torch.float)
+        sMRI_edge = torch.tensor(s["sMRI_edge_index"], dtype=torch.long)
+        dMRI_edge = torch.tensor(s["dMRI_edge_index"], dtype=torch.long)
+
+        return dist_sMRI, dist_dMRI, sMRI_edge, dMRI_edge, age
+
+
+# ---------- 2. 因果效应模块 ----------
+
+def safe_conditional_MI(x: torch.Tensor, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """包装 `calculate_conditional_MI`，当样本数 < 2 时返回 0，避免 k out‑of‑range。"""
+    if x.size(0) < 2:  # e.g. batch_size == 1
+        return torch.tensor(0.0, device=x.device)
+    return calculate_conditional_MI(x, z, y)
+
+
+def joint_uncond(
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    data: Data,
+    causal_decoder: GraphDecoder,
+    regressor: SingleGraphTransformer,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """返回 (ce, pred)。"""
+
+    if getattr(data, "batch", None) is None:
+        data.batch = torch.zeros(data.x.size(0), dtype=torch.long, device=device)
+
+    graph_alpha = global_mean_pool(alpha.to(device), data.batch)
+    graph_beta  = global_mean_pool(beta.to(device),  data.batch)
+
+    # 预测
+    pred = regressor(data)
+
+    # labels → (B,1)
+    labels = data.y.to(device).float().view(-1, 1)
+    ce = safe_conditional_MI(graph_alpha, labels, graph_beta)
+
+    return ce, pred
+
+
+# ---------- 3. 训练 ----------
+
+def main():  # noqa: D401
+    json_path = Path("decoupled_data2.json")
+    if not json_path.exists():
+        raise FileNotFoundError(json_path)
+
+    dataset = GraphDecoupledDataset(json_path)
+    print(f"Loaded {len(dataset)} samples from {json_path}")
+
+    n_train = int(0.8 * len(dataset))
+    train_ds, test_ds = random_split(dataset, [n_train, len(dataset) - n_train], generator=torch.Generator().manual_seed(42))
+    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
+    test_loader  = DataLoader(test_ds,  batch_size=1)
+
+    dist_s_ex, dist_d_ex, *_ = dataset[0]
+    F_s, F_d = dist_s_ex.size(1), dist_d_ex.size(1)
+
+    hidden = 64
+    latent_dim = hidden // 2  # 32
+    λ_reg, λ_mi, λ_ce = 0.1, 0.1, 0.005
+    epochs = 100
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    s_trans = SingleGraphTransformer(F_s, hidden).to(device)
+    d_trans = SingleGraphTransformer(F_d, hidden).to(device)
+    decoder = GraphDecoder(latent_dim, hidden).to(device)
+
+    opt = optim.Adam(list(s_trans.parameters()) + list(d_trans.parameters()) + list(decoder.parameters()), lr=1e-4)
+    crit = nn.MSELoss()
+
+    for ep in range(1, epochs + 1):
+        s_trans.train(); d_trans.train(); decoder.train()
+        tot_loss = tot_reg = tot_mi = 0.
+
+        for dist_s, dist_d, e_s, e_d, age in train_loader:
+            dist_s, dist_d = dist_s.squeeze(0).to(device), dist_d.squeeze(0).to(device)
+            e_s, e_d = e_s.squeeze(0).to(device), e_d.squeeze(0).to(device)
+            age = age.to(device).float()
+
+            opt.zero_grad()
+
+            # ---- 嵌入 ----
+            s_embed = s_trans.encoder(dist_s)  # (N_s,64)
+            d_embed = d_trans.encoder(dist_d)
+            split = latent_dim
+            s_a, s_b = s_embed[:, :split], s_embed[:, split:]
+            d_a, d_b = d_embed[:, :split], d_embed[:, split:]
+
+            # ---- MI ----
+            s_mi = calculate_MI(s_a, s_b)
+            d_mi = calculate_MI(d_a, d_b)
+            x_mi = calculate_MI(s_a, d_a)
+            mi_loss = λ_mi * (s_mi + d_mi + x_mi)
+
+            # ---- 因果 + 预测 ----
+            s_graph = Data(x=dist_s, edge_index=e_s, y=age)
+            d_graph = Data(x=dist_d, edge_index=e_d, y=age)
+            ce_s, pred_s = joint_uncond(s_a, s_b, s_graph, decoder, s_trans, device)
+            ce_d, pred_d = joint_uncond(d_a, d_b, d_graph, decoder, d_trans, device)
+            ce_loss = λ_ce * (ce_s + ce_d)
+
+            # ---- 回归 ----
+            y_true = age.unsqueeze(0).unsqueeze(1)
+            reg_loss = λ_reg * (crit(pred_s, y_true) + crit(pred_d, y_true))
+
+            # ---- 总损失 ----
+            loss = reg_loss + mi_loss - ce_loss
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(list(s_trans.parameters()) + list(d_trans.parameters()) + list(decoder.parameters()), 5.)
+            opt.step()
+
+            tot_loss += loss.item(); tot_reg += reg_loss.item(); tot_mi += mi_loss.item()
+
+        print(f"[Train] Epoch {ep:3d}/{epochs} | Loss {tot_loss/len(train_loader):.4f} | Reg {tot_reg/len(train_loader):.4f} | MI {tot_mi/len(train_loader):.4f}")
+
+    # ---------- 4. 测试 ----------
+    s_trans.eval(); d_trans.eval(); decoder.eval()
+    preds, gts = [], []
+    with torch.no_grad():
+        for dist_s, dist_d, e_s, e_d, age in test_loader:
+            dist_s, dist_d = dist_s.squeeze(0).to(device), dist_d.squeeze(0).to(device)
+            e_s, e_d = e_s.squeeze(0).to(device), e_d.squeeze(0).to(device)
+            age = age.to(device).float()
+
+            s_embed = s_trans.encoder(dist_s)
+            d_embed = d_trans.encoder(dist_d)
+            split = latent_dim
+            s_a, s_b = s_embed[:, :split], s_embed[:, split:]
+            d_a, d_b = d_embed[:, :split], d_embed[:, split:]
+
+            s_graph = Data(x=dist_s, edge_index=e_s, y=age)
+            d_graph = Data(x=dist_d, edge_index=e_d, y=age)
+            _, p_s = joint_uncond(s_a, s_b, s_graph, decoder, s_trans, device)
+            _, p_d = joint_uncond(d_a, d_b, d_graph, decoder, d_trans, device)
+            preds.append(0.5 * (p_s.item() + p_d.item()))
+            gts.append(age.item())
+
+    preds, gts = np.array(preds), np.array(gts)
+    mae = np.mean(np.abs(preds - gts))
+    rmse = np.sqrt(np.mean((preds - gts) ** 2))
+    r2 = 1 - np.sum((preds - gts) ** 2) / np.sum((gts - gts.mean()) ** 2)
+    pcc = np.corrcoef(preds, gts)[0, 1]
+
+    print("\n[TEST] MAE {:.3f} | RMSE {:.3f} | R² {:.3f} | PCC {:.3f}".format(mae, rmse, r2, pcc))
+
+
+if __name__ == "__main__":
+    main()
